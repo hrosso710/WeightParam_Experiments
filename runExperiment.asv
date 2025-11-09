@@ -1,0 +1,230 @@
+% store the solution, all variables needed, etc. then
+% write a script that calls this function and loops over different T,
+% different optimization, architecture, degree, etc.
+
+
+function runExperiment(dynamic,T,d,opti,basis)
+
+% dynamic is an element of 'antiSym-ResNN','ResNN','hamiltonian', 'leapfrog'
+% T is final time
+% d is degree of the polynomial basis
+% opti is an element of 'sgd', 'gnvpro'
+% basis is an element of 'Monomial','Legendre' ; default='monomial'
+
+% file to save results and training flag
+doSave  = 0; % save file
+
+if not(exist('basis','var')) || isempty(basis)
+    basis = 'monomial';
+end
+
+if doSave
+    resFile = sprintf('%s-%s-%s-%s',date,datestr(now,'hh-MM-ss','local'),mfilename,dynamic);
+    copyfile(['examples/GNvpro/',mfilename,'.m'],[resFile,'.m']);  % save copy of script
+    diary([resFile,'.txt']);              % save diary of printouts
+end
+
+rng(42);
+[Yt,Ct,Yv,Cv,Ytest,Ctest] = setupNNERDS();
+
+rng(20);
+
+nt      = 12;   % number of time steps (will not prolongate with nt=1)
+nc      = 15;   % number of channels (width)
+
+% regularization
+alpha1 = 1e-5; % theta
+alpha2 = 1e-3; % W
+
+% setup network
+
+% first block
+block1 = NN({singleLayer(dense([nc,size(Yt,1)],'Bin',eye(nc)))});
+
+% second block (ResNN, keeps size fixed)
+switch dynamic
+    case 'ResNN'
+        K       = dense([nc,nc]);
+        layer   = singleLayer(K,'Bin',eye(nc));
+        tY      = linspace(0,T,nt);
+        
+        tA = linspace(0,T,nt); % array of time points
+        A = tA(:).^(0:d);
+        if nargin < 5
+            Q = A;
+            block2  = ResNN(layer,nt,T/nt,'A',Q');
+        else 
+            [Q,~] = qr(A);
+             block2  = ResNN(layer,nt,T/nt,'A',Q');
+        end
+%         if exist( 'Q','var' ) == 1
+%              [Q,~] = qr(A);
+%              block2  = ResNN(layer,nt,T/nt,'A',Q');
+%         else
+%              block2  = ResNN(layer,nt,T/nt,'A',A');
+%         end       
+        % block2  = ResNNrk4(layer,tY,'A',A');      
+        % block2  = ResNN(layer,nt,T/nt);
+    case 'antiSym-ResNN'
+        K       = getDenseAntiSym([nc,nc]);
+        layer   = singleLayer(K,'Bin',eye(nc));
+        tY      = linspace(0,T,nt);
+        block2  = ResNNrk4(layer,tY,tY);
+    case 'leapfrog'
+        K      = dense([nc,nc]);
+        layer  = doubleSymLayer(K,'Bout',eye(nc));
+        tA = linspace(0,T,nt);
+        A = tA(:).^(0:d);
+        [Q,~] = qr(A);
+        block2 = LeapFrogNN(layer,nt,T/nt,'A',A');
+    case 'hamiltonian'
+        K       = dense([nc,nc]);
+        tA = linspace(0,T,nt); 
+        A = tA(:).^(0:d);
+        [Q,~,~] = qr(A,0);
+        block2  = HamiltonianNN(@tanhActivation,K,eye(nc),nt,T/nt,'A',A');
+    otherwise
+        error('Example %s not yet implemented',dynamic);
+end
+
+h = T/nt;
+% combine both blocks
+net = Meganet({block1,block2});
+
+% setup regression and Newton solver for this subproblem
+pLoss = regressionLoss();
+
+switch opti
+    case 'sgd'
+        % setup outer optimization scheme
+        opt = sgd('nesterov',false,'ADAM',true,'miniBatch',32,'out',1,'lossTol',0.01);
+
+        % lr = 0.1*1.5.^(-1:-1:-14)';
+        % lr = [0.1*ones(40,1);  kron(lr,ones(10,1))];
+        % lr = lr/2;
+
+        opt.learningRate     =  0.001; %@(epoch) lr(epoch);
+        opt.maxEpochs    = 10000;
+    %   opt.P        = @(x) min(max(x,-1),1);
+    %   opt.momentum = 0.9;
+
+        % setup objective function with training and validation data (SGD)
+        fctn = dnnObjFctn(net,[],pLoss,[],Yt,Ct);
+        fval = dnnObjFctn(net,[],pLoss,[],Yv,Cv);
+
+        % solve the problem
+        th0 = initTheta(net);
+        startTime = tic;
+        W = randn(10,16);
+
+        [thW,his]  = solve(opt,fctn,[th0;W(:)],fval);  % concatenates th0 with W 
+
+        endTime = toc(startTime);
+        disp(['Elapsed Time is ',num2str(endTime),' seconds.']);
+
+        [thOpt,WOpt] = split(fctn,thW);
+
+        if doSave
+        save(resFile,'net','thOpt','WOpt','his');
+        end
+    
+    case 'GNvpro'
+        opt                 = trnewton();
+        opt.linSol          = GMRES('m',20,'tol',1e-2);
+        opt.out             = 1;
+        opt.maxIter         = Inf;
+        opt.maxWorkUnits    = 4000;
+        opt.atol            = 1e-16;
+        opt.rtol            = 1e-16;
+
+        % setup objective function with training and validation data
+        fctn = dnnVarProRegressionObjFctn(net,pLoss,Yt,Ct,'alpha1',alpha1,'alpha2',alpha2);
+        fval = dnnObjFctn(net,[],pLoss,[],Yv,Cv);
+
+        % solve the problem
+        th0 = initTheta(net);
+        startTime = tic;
+
+    [th0,his]  = solve(opt,fctn,th0,fval);
+    
+    
+   end
+
+    thOpt = th0;
+
+    endTime = toc(startTime);
+    disp(['Elapsed Time is ',num2str(endTime),' seconds.']);
+
+    [Jc,para] = eval(fctn,thOpt);
+    WOpt      = reshape(para.W,size(Ct,1),[]);
+    
+    if doSave
+    save(resFile,'net','thOpt','WOpt','his');
+    end
+end 
+
+
+
+
+%% Numerical results
+
+% training
+YNt = forwardProp(net,thOpt,Yt);
+WYt = reshape(WOpt,size(Ct,1),[]) * [YNt; ones(1,size(YNt,2))];
+relErrTrain = sqrt(sum((WYt - Ct).^2,1)) ./ sqrt(sum(Ct.^2,1));
+
+% validation
+YNv = forwardProp(net,thOpt,Yv);
+WYv = reshape(WOpt,size(Ct,1),[]) * [YNv; ones(1,size(YNv,2))];
+relErrVal = sqrt(sum((WYv - Cv).^2,1)) ./ sqrt(sum(Cv.^2,1));
+
+% test
+YNtest = forwardProp(net,thOpt,Ytest);
+WYtest = reshape(WOpt,size(Ct,1),[]) * [YNtest; ones(1,size(YNtest,2))];
+relErrTest = sqrt(sum((WYtest - Ctest).^2,1)) ./ sqrt(sum(Ctest.^2,1));
+
+fprintf('%-8smean\t+/-std\t\tmin\tmax\n','')
+fprintf('Train:\t%0.4f\t+/-%0.4f\t%0.4f\t%0.4f\n',mean(relErrTrain),std(relErrTrain),min(relErrTrain),max(relErrTrain));
+fprintf('Val:\t%0.4f\t+/-%0.4f\t%0.4f\t%0.4f\n',mean(relErrVal),std(relErrVal),min(relErrVal),max(relErrVal));
+fprintf('Test:\t%0.4f\t+/-%0.4f\t%0.4f\t%0.4f\n',mean(relErrTest),std(relErrTest),min(relErrTest),max(relErrTest));
+
+if doSave
+    save(resFile,'relErrTrain','relErrVal','relErrTest','-append');
+end
+
+% Plots
+
+% fitting
+xx = linspace(0,1,100);
+figure(); clf;
+for k=1:10
+    subplot(2,5,k)
+    plot(xx,xx,'-k')
+    hold on;
+    plot(Ct(k,:),WYt(k,:),'.b');
+    hold on
+    plot(Ctest(k,:),WYtest(k,:),'.r');
+    axis([0 1 0 1])
+    axis square
+    xlabel('data')
+    ylabel('model output')
+    title(sprintf('compoment %d',k))
+    set(gca,'FontSize',14)
+end
+legend('','training','test','location','southeast')
+
+% Optimality conditions for a given training algorithm
+optCond = his.his(:,4);
+trainingLoss = his.his(:,14); 
+valLoss = his.his(:,19);
+figure()
+semilogy(optCond,'.-')
+hold on
+semilogy(trainingLoss,'.-')
+hold on 
+semilogy(valLoss,'.-')
+ylim([10^(-3) 10^1])
+xlim([0 100])
+xlabel('Iteration Count', 'Interpreter', 'latex')
+legend('$\frac{|dJ|}{|dJ_0|}$','Training Loss','Validation Loss','Interpreter', 'latex')
+
