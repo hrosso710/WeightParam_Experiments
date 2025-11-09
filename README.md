@@ -49,6 +49,7 @@ At the top level, the repository has the following layout:
     ├── viewers/
     ├── Meganet.m
     └── README.md    # Original Meganet README
+```
 
 ## 2. Requirements
 
