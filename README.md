@@ -18,6 +18,7 @@ which uses
 
 At the top level, the repository has the following layout:
 
+```text
 ├── data
 │   ├── NNERDS.mat
 │   ├── param_range.txt
